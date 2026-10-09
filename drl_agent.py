@@ -67,24 +67,37 @@ class WD_Agent:
         self.log_prob_off = dist.log_prob(action)
         return action.item()
 
-    def update(self, reward, bs_coef=1.0, off_coef=1.0):
+    def update(self, reward):
         """
         用 REINFORCE 更新两个网络
         reward: 标量，本步的奖励（已归一化）
         """
         # 基站选择网络
         if self.log_prob_bs is not None:
-            loss_bs = -self.log_prob_bs * reward * bs_coef
+            loss_bs = -self.log_prob_bs * reward
             self.opt_bs.zero_grad()
             loss_bs.backward(retain_graph=True)
             self.opt_bs.step()
 
         # 卸载决策网络
         if self.log_prob_off is not None:
-            loss_off = -self.log_prob_off * reward * off_coef
+            loss_off = -self.log_prob_off * reward
             self.opt_off.zero_grad()
             loss_off.backward()
             self.opt_off.step()
+
+    def save(self, path):
+        #模型保存
+        torch.save({
+            'policy_bs': self.policy_bs.state_dict(),
+            'policy_off': self.policy_off.state_dict(),
+        }, path)
+
+    def load(self, path):
+        #模型加载
+        ckpt = torch.load(path)
+        self.policy_bs.load_state_dict(ckpt['policy_bs'])
+        self.policy_off.load_state_dict(ckpt['policy_off'])
 
 
 class MultiAgentDRL:
@@ -99,7 +112,6 @@ class MultiAgentDRL:
         ]
         # 奖励归一化：用滑动平均
         self.reward_mean = 0.0
-        self.reward_std = 1.0
         self.reward_count = 0
 
     def select_actions(self, h_sbs, h_mbs):
@@ -134,10 +146,19 @@ class MultiAgentDRL:
         self.reward_count += 1
         alpha = 0.01
         self.reward_mean = (1 - alpha) * self.reward_mean + alpha * reward
-        self.reward_std = max(self.reward_std, abs(reward - self.reward_mean) + 1e-6)
 
         # 归一化奖励（除以 reward_mean，让量级接近 1）
         r_norm = reward / (abs(self.reward_mean) + 1e-6)
 
         for agent in self.agents:
             agent.update(r_norm)
+
+    def save_all(self, dir_path):
+        import os
+        os.makedirs(dir_path, exist_ok=True)
+        for i, agent in enumerate(self.agents):
+            agent.save(f"{dir_path}/agent_{i}.pt")
+
+    def load_all(self, dir_path):
+        for i, agent in enumerate(self.agents):
+            agent.load(f"{dir_path}/agent_{i}.pt")
