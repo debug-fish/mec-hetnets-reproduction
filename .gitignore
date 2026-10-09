@@ -1,0 +1,20 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+# 虚拟环境
+mec_env/
+venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code 配置
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 数据文件（后面生成的大文件）
+*.npy
+*.mat
+*.pkl
