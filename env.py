@@ -1,4 +1,5 @@
 import numpy as np
+from bandwidth_alloc import allocate_bandwidth
 
 class MECEnvironment:
     """
@@ -62,34 +63,56 @@ class MECEnvironment:
         """
         return x_offload * E / ((1 - self.a) * self.T)
 
-    # ========== SBS 卸载速率（公式 4-6） ==========
-    def sbs_offload_rate(self, P_wd, h_sbs, sbs_idx, b_sbs):
+    def sbs_offload_rate(self, P_wd, h_sbs, sbs_idx, b_sbs_total):
         """
-        P_wd: (m_wd,) 发射功率
-        h_sbs: (m_wd, n_sbs) 信道增益
-        sbs_idx: (m_wd,) 选中的 SBS
-        b_sbs: (m_wd,) 每个 WD 分到的带宽
-        返回：每个 WD 卸载到 SBS 的实际速率（取传输速率和计算速率的 min）
+        每个 SBS 独立分配自己的带宽，用凸优化
         """
-        h_assoc = h_sbs[np.arange(self.m_wd), sbs_idx]
-        # 传输速率（公式 4）
-        sinr = P_wd * h_assoc / (self.N0 * b_sbs + 1e-30)
-        R_trans = b_sbs * np.log2(1 + sinr)
-        # 计算速率（公式 5），这里假设算力平均分配，后续会换成凸优化结果
-        f_sbs = 1.0 / self.m_wd
+        m = self.m_wd
+        R_trans = np.zeros(m)
+
+        for j in range(self.n_sbs):
+            mask = (sbs_idx == j)
+            if mask.sum() == 0:
+                continue
+
+            # A_i = P_wd * h / N0
+            A_vec = P_wd[mask] * h_sbs[mask, j] / self.N0
+            A_vec = np.maximum(A_vec, 1e-12)  # 防止除零
+
+            # 凸优化分带宽
+            b_vec = allocate_bandwidth(A_vec, b_sbs_total)
+
+            # 传输速率
+            R_trans[mask] = b_vec * np.log2(1 + A_vec / b_vec)
+
+        # 算力分配
+        f_sbs = self.allocate_compute(R_trans, self.F_sbs_max, self.phi_sbs)
         R_comp = self.F_sbs_max * f_sbs / self.phi_sbs
-        # 取 min（公式 6）
+
         return np.minimum(R_trans, R_comp)
 
-    def mbs_offload_rate(self, P_wd, h_mbs, b_mbs):
-        sinr = P_wd * h_mbs / (self.N0 * b_mbs + 1e-30)
-        R_trans = b_mbs * np.log2(1 + sinr)
-        f_mbs = 1.0 / self.m_wd
+    def mbs_offload_rate(self, P_wd, h_mbs, b_mbs_total):
+        """
+        MBS 独立分配带宽，只服务卸载到 MBS 的设备
+        """
+        m = self.m_wd
+        R_trans = np.zeros(m)
+
+        mask = P_wd > 0
+        if mask.sum() > 0:
+            A_vec = P_wd[mask] * h_mbs[mask] / self.N0
+            A_vec = np.maximum(A_vec, 1e-12)
+
+            b_vec = allocate_bandwidth(A_vec, b_mbs_total)
+            R_trans[mask] = b_vec * np.log2(1 + A_vec / b_vec)
+
+        f_mbs = self.allocate_compute(R_trans, self.F_mbs_max, self.phi_mbs)
         R_comp = self.F_mbs_max * f_mbs / self.phi_mbs
-        return np.minimum(R_trans, R_comp)
 
+        return np.minimum(R_trans, R_comp)
+    
     # ========== 总计算速率（公式 10） ==========
-    def total_rate(self, x, sbs_idx, b_sbs, b_mbs, h_sbs, h_mbs):
+    def total_rate(self, x, sbs_idx, h_sbs, h_mbs):
         """
         x: (m_wd, 3) one-hot，每行表示本地/SBS/MBS
         """
@@ -99,8 +122,8 @@ class MECEnvironment:
         x_offload = x[:, 1] + x[:, 2]
         P_wd = self.offload_power(E, x_offload)
 
-        R_sbs = self.sbs_offload_rate(P_wd, h_sbs, sbs_idx, b_sbs)
-        R_mbs = self.mbs_offload_rate(P_wd, h_mbs, b_mbs)
+        R_sbs = self.sbs_offload_rate(P_wd, h_sbs, sbs_idx, self.b_sbs_total)
+        R_mbs = self.mbs_offload_rate(P_wd, h_mbs, self.b_mbs_total)
 
         R_total = (
             x[:, 0] * R_local +
@@ -108,6 +131,35 @@ class MECEnvironment:
             x[:, 2] * R_mbs
         )
         return R_total.sum(), R_total
+
+    def allocate_compute(self, R_offload, F_max, phi):
+        """
+        论文 Section IV-B2 算力分配：
+        情况 1（算力不够）：按卸载速率从高到低优先分配
+        情况 2（算力够用）：按卸载速率比例分配
+        """
+        m = len(R_offload)
+        f = np.zeros(m)
+
+        total_offload_rate = R_offload.sum()
+        max_supported_rate = F_max / phi
+
+        if total_offload_rate > max_supported_rate:
+            # 情况 1：算力不够
+            sorted_idx = np.argsort(R_offload)[::-1]
+            remaining_rate = max_supported_rate
+            for idx in sorted_idx:
+                if remaining_rate <= 0:
+                    break
+                allocated = min(R_offload[idx], remaining_rate)
+                f[idx] = allocated * phi / F_max
+                remaining_rate -= allocated
+        else:
+            # 情况 2：算力够用，按比例分配
+            if total_offload_rate > 0:
+                f = R_offload / total_offload_rate
+
+        return f
 
 
 # ================= 测试 =================
@@ -126,12 +178,9 @@ if __name__ == "__main__":
     choices = env.rng.integers(0, 3, size=env.m_wd)
     x[np.arange(env.m_wd), choices] = 1
 
-    # 平均带宽（先用平均分配验证）
-    b_sbs = np.full(env.m_wd, env.b_sbs_total / env.m_wd)
-    b_mbs = np.full(env.m_wd, env.b_mbs_total / env.m_wd)
-
-    R_total, R_each = env.total_rate(x, sbs_idx, b_sbs, b_mbs, h_sbs, h_mbs)
+    R_total, R_each = env.total_rate(x, sbs_idx, h_sbs, h_mbs)
     print("每个 WD 的计算速率:", R_each)
     print("系统总计算速率 R_total:", R_total)
-    print("SBS 信道增益均值:", h_sbs.mean())
-    print("MBS 信道增益均值:", h_mbs.mean())
+
+    print("基站选择:", sbs_idx)
+    print("卸载决策:", choices)  # 0=本地, 1=SBS, 2=MBS
