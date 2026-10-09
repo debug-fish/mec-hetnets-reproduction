@@ -15,6 +15,5 @@ __pycache__/
 .ipynb_checkpoints/
 
 # 数据文件（后面生成的大文件）
-*.npy
 *.mat
 *.pkl
