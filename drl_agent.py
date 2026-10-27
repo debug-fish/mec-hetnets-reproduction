@@ -50,11 +50,17 @@ class WD_Agent:
         """
         h_tensor = torch.tensor(h_sel, dtype=torch.float32)
         probs = self.policy_bs(h_tensor)  # (n_sbs,)
-        dist = torch.distributions.Categorical(probs)
+
+        # [MOD] 引入温度系数：在 MultiAgentDRL 中传入，或者简单点这里写死
+        # 训练初期可以大一点探索，后期变小（比如设为 0.5）
+        temperature = getattr(self, 'temperature', 1.0) 
+        
+        # 重新计算分布
+        dist = torch.distributions.Categorical(logits=torch.log(probs + 1e-8) / temperature)
         action = dist.sample()
         self.log_prob_bs = dist.log_prob(action)
         return action.item()
-
+    
     def select_offload(self, h_off):
         """
         h_off: (2,) = [h_mbs, h_sbs_j]
@@ -62,7 +68,9 @@ class WD_Agent:
         """
         h_tensor = torch.tensor(h_off, dtype=torch.float32)
         probs = self.policy_off(h_tensor)
-        dist = torch.distributions.Categorical(probs)
+
+        temperature = getattr(self, 'temperature', 1.0)
+        dist = torch.distributions.Categorical(logits=torch.log(probs + 1e-8) / temperature)
         action = dist.sample()
         self.log_prob_off = dist.log_prob(action)
         return action.item()
@@ -114,6 +122,10 @@ class MultiAgentDRL:
         self.reward_mean = 0.0
         self.reward_count = 0
 
+        # [MOD] 新增：每个设备的独立奖励基线
+        self.reward_means_individual = np.zeros(m_wd)
+        self.reward_counts_individual = np.zeros(m_wd)
+
     def select_actions(self, h_sbs, h_mbs):
         """
         h_sbs: (m_wd, n_sbs)
@@ -139,19 +151,60 @@ class MultiAgentDRL:
 
     def update_all(self, reward):
         """
-        用同一个 reward 更新所有 agent
-        先对 reward 做归一化，避免梯度爆炸
+        用 Advantage (优势函数) 代替绝对奖励，抑制单步更新带来的剧烈震荡
         """
-        # 滑动平均归一化
         self.reward_count += 1
         alpha = 0.01
-        self.reward_mean = (1 - alpha) * self.reward_mean + alpha * reward
+        # 第一次直接用当前奖励初始化均值
+        if self.reward_count == 1:
+            self.reward_mean = reward
+        else:
+            self.reward_mean = (1 - alpha) * self.reward_mean + alpha * reward
 
-        # 归一化奖励（除以 reward_mean，让量级接近 1）
-        r_norm = reward / (abs(self.reward_mean) + 1e-6)
+        # 【核心修改】使用 r - baseline。如果比平均好，给正梯度；比平均差，给负梯度
+        advantage = reward - self.reward_mean
+        
+        # 固定缩放，让梯度的量级保持在合理范围内（可根据实际 R_total 微调 1e8 这个分母）
+        r_norm = advantage / 1e8
+        
+        # 可选：引入一个微小的放大系数，加速收敛
+        r_norm *= 10.0 
 
         for agent in self.agents:
             agent.update(r_norm)
+
+    def update_all_individual(self, rewards_each):
+        """
+        [MOD] 独立更新：每个 agent 根据自己计算的 R_each 更新自己的网络
+        rewards_each: (m_wd,) 的数组，对应 env.total_rate 返回的 R_each
+        """
+        alpha = 0.05
+        
+        # [MOD] 先统一算好这一步的温度系数
+        # reward_counts_individual[0] 代表第一个设备已经更新的步数
+        current_temp = max(0.1, 1.0 - (self.reward_counts_individual[0] / 5000.0))
+        
+        for i, agent in enumerate(self.agents):
+            reward = float(rewards_each[i])  # 转成浮点数，防止 numpy 广播
+            
+            self.reward_counts_individual[i] += 1
+            
+            # 初始化或更新当前 agent 的滑动平均基线
+            if self.reward_counts_individual[i] == 1:
+                self.reward_means_individual[i] = reward
+            else:
+                self.reward_means_individual[i] = (1 - alpha) * self.reward_means_individual[i] + alpha * reward
+            
+            # 计算优势（当前奖励 - 历史平均水平）
+            advantage = reward - self.reward_means_individual[i]
+            
+            # 动态归一
+            scale = abs(self.reward_means_individual[i]) + 1e-6
+            r_norm = advantage / scale
+            
+            # [MOD] 设置当前 agent 的温度，并更新它的网络
+            agent.temperature = current_temp
+            agent.update(r_norm) 
 
     def save_all(self, dir_path):
         import os

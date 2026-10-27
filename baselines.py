@@ -63,7 +63,7 @@ class QLearningAgent:
 
     def update(self, reward, h_sbs_next, h_mbs_next):
         # 简单 Q 更新：用同一 reward 更新所有设备
-        r_norm = reward / (abs(reward) + 1e-6)
+        r_norm = reward / 1e8
         for i in range(self.m_wd):
             s = self.last_state_bs[i]
             a = self.last_action_bs[i]
@@ -132,7 +132,7 @@ class DQNAgent:
         return sbs_idx, offload_actions
 
     def update(self, reward, h_sbs_next, h_mbs_next):
-        r_norm = reward / (abs(reward) + 1e-6)
+        r_norm = reward / 1e8
         for i in range(self.m_wd):
             # 基站选择
             s = torch.tensor(self.last_h_sbs[i], dtype=torch.float32)
@@ -186,11 +186,11 @@ def train_baseline(baseline_name, seed, n_frames=10000, n_sbs=3, m_wd=5):
         x = actions_to_onehot(offload_actions, m_wd)
         R_total, _ = env.total_rate(x, sbs_idx, h_sbs, h_mbs)
 
-        # 生成下一帧信道用于 Q 更新（简化处理，和当前帧共用）
+        # 生成下一帧信道用于 Q 更新
         h_sbs_next = env.channel_gain(env.d_sbs)
         h_mbs_next = env.channel_gain(env.d_mbs)
+        
         agent.update(R_total, h_sbs_next, h_mbs_next)
-
         log.append(R_total)
 
     return np.array(log)

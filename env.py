@@ -14,7 +14,7 @@ class MECEnvironment:
         # ===== 论文 Table II 的参数 =====
         self.mu = 0.8                          # 能量转换效率
         self.P_sbs = 3.0                       # SBS 发射功率 (W)
-        self.phi_wd = 5900                     # WD 处理 1 bit 周期数 (cycles/byte 近似)
+        self.phi_wd = 5900                     # [KEEP] 论文 Table II 原值 cycles/byte；式(3) 理论用 cycles/bit
         self.phi_sbs = 1000                    # SBS 处理 1 bit 周期数 (cycles/bit)
         self.phi_mbs = 1000                    # MBS 处理 1 bit 周期数 (cycles/bit)
         self.k_wd = 1e-28                      # WD 计算能效系数
@@ -27,11 +27,14 @@ class MECEnvironment:
         self.T = 1.0                           # 时隙长度
 
         # 设备到基站的距离（可自行调整）
-        self.d_sbs = self.rng.uniform(5, 20, size=(self.m_wd, self.n_sbs))
-        self.d_mbs = self.rng.uniform(20, 100, size=self.m_wd)
+        self.d_sbs = self.rng.uniform(2, 10, size=(self.m_wd, self.n_sbs))
+        self.d_mbs = self.rng.uniform(10, 30, size=self.m_wd)
+
+        self.h_sbs_base = self.channel_gain(self.d_sbs)
+        self.h_mbs_base = self.channel_gain(self.d_mbs)
 
     # ========== 信道模型 ==========
-    def channel_gain(self, d, alpha=2.0, Gamma=0.2):
+    def channel_gain(self, d, alpha=2.0, Gamma=0.3):
         small_scale = self.rng.exponential(1.0, size=d.shape)
         return Gamma * (d ** (-alpha)) * small_scale
 
@@ -63,51 +66,52 @@ class MECEnvironment:
         """
         return x_offload * E / ((1 - self.a) * self.T)
 
-    def sbs_offload_rate(self, P_wd, h_sbs, sbs_idx, b_sbs_total):
+    def sbs_offload_rate(self, P_wd, h_sbs, sbs_idx, b_sbs_total,x_mask):
         """
         每个 SBS 独立分配自己的带宽，用凸优化
         """
         m = self.m_wd
         R_trans = np.zeros(m)
+        R_comp = np.zeros(m)                               # [MOD-2] 单独存计算速率
 
         for j in range(self.n_sbs):
-            mask = (sbs_idx == j)
+            # [MOD-2] 同时排除「未卸载」和「卸载到 MBS」的用户
+            mask = (sbs_idx == j) & (x_mask > 0)
             if mask.sum() == 0:
                 continue
 
-            # A_i = P_wd * h / N0
             A_vec = P_wd[mask] * h_sbs[mask, j] / self.N0
-            A_vec = np.maximum(A_vec, 1e-12)  # 防止除零
-
-            # 凸优化分带宽
+            A_vec = np.maximum(A_vec, 1e-12)
             b_vec = allocate_bandwidth(A_vec, b_sbs_total)
-
-            # 传输速率
             R_trans[mask] = b_vec * np.log2(1 + A_vec / b_vec)
 
-        # 算力分配
-        f_sbs = self.allocate_compute(R_trans, self.F_sbs_max, self.phi_sbs)
-        R_comp = self.F_sbs_max * f_sbs / self.phi_sbs
+            # [MOD-2] 算力只在「该 SBS 的卸载子集」上分配并归一（C4: sum f = 1）
+            R_sub = R_trans[mask]
+            f_sub = self.allocate_compute(R_sub, self.F_sbs_max, self.phi_sbs)
+            R_comp[mask] = self.F_sbs_max * f_sub / self.phi_sbs
 
         return np.minimum(R_trans, R_comp)
 
-    def mbs_offload_rate(self, P_wd, h_mbs, b_mbs_total):
+    def mbs_offload_rate(self, P_wd, h_mbs, b_mbs_total, x_mask):
         """
         MBS 独立分配带宽，只服务卸载到 MBS 的设备
         """
         m = self.m_wd
         R_trans = np.zeros(m)
+        R_comp = np.zeros(m)                               # [MOD-3]
 
-        mask = P_wd > 0
+        # [MOD-3] 显式用卸载决策 mask，不再依赖 P_wd > 0
+        mask = x_mask > 0
         if mask.sum() > 0:
             A_vec = P_wd[mask] * h_mbs[mask] / self.N0
             A_vec = np.maximum(A_vec, 1e-12)
-
             b_vec = allocate_bandwidth(A_vec, b_mbs_total)
             R_trans[mask] = b_vec * np.log2(1 + A_vec / b_vec)
 
-        f_mbs = self.allocate_compute(R_trans, self.F_mbs_max, self.phi_mbs)
-        R_comp = self.F_mbs_max * f_mbs / self.phi_mbs
+            # [MOD-3] 算力只在 MBS 卸载子集上分配并归一（C4: sum f = 1）
+            R_sub = R_trans[mask]
+            f_sub = self.allocate_compute(R_sub, self.F_mbs_max, self.phi_mbs)
+            R_comp[mask] = self.F_mbs_max * f_sub / self.phi_mbs
 
         return np.minimum(R_trans, R_comp)
     
@@ -119,11 +123,13 @@ class MECEnvironment:
         E = self.harvested_energy(h_sbs, sbs_idx)
         R_local = self.local_rate(E)
 
-        x_offload = x[:, 1] + x[:, 2]
-        P_wd = self.offload_power(E, x_offload)
+        x_sbs = x[:, 1]          # 卸载到 SBS 的用户
+        x_mbs = x[:, 2]          # 卸载到 MBS 的用户
+        P_sbs = self.offload_power(E, x_sbs)
+        P_mbs = self.offload_power(E, x_mbs)
 
-        R_sbs = self.sbs_offload_rate(P_wd, h_sbs, sbs_idx, self.b_sbs_total)
-        R_mbs = self.mbs_offload_rate(P_wd, h_mbs, self.b_mbs_total)
+        R_sbs = self.sbs_offload_rate(P_sbs, h_sbs, sbs_idx, self.b_sbs_total, x_sbs)
+        R_mbs = self.mbs_offload_rate(P_mbs, h_mbs, self.b_mbs_total, x_mbs)
 
         R_total = (
             x[:, 0] * R_local +
@@ -165,22 +171,53 @@ class MECEnvironment:
 # ================= 测试 =================
 if __name__ == "__main__":
     env = MECEnvironment(n_sbs=3, m_wd=5, seed=0)
-
-    # 生成信道
     h_sbs = env.channel_gain(env.d_sbs)
     h_mbs = env.channel_gain(env.d_mbs)
-
-    # 随机基站选择
     sbs_idx = env.rng.integers(0, env.n_sbs, size=env.m_wd)
-
-    # 随机卸载决策（one-hot）
     x = np.zeros((env.m_wd, 3))
     choices = env.rng.integers(0, 3, size=env.m_wd)
     x[np.arange(env.m_wd), choices] = 1
 
-    R_total, R_each = env.total_rate(x, sbs_idx, h_sbs, h_mbs)
-    print("每个 WD 的计算速率:", R_each)
-    print("系统总计算速率 R_total:", R_total)
+    E = env.harvested_energy(h_sbs, sbs_idx)
+    R_local = env.local_rate(E)
 
+    x_sbs, x_mbs = x[:, 1], x[:, 2]
+    P_sbs = env.offload_power(E, x_sbs)
+    P_mbs = env.offload_power(E, x_mbs)
+    R_sbs = env.sbs_offload_rate(P_sbs, h_sbs, sbs_idx, env.b_sbs_total, x_sbs)
+    R_mbs = env.mbs_offload_rate(P_mbs, h_mbs, env.b_mbs_total, x_mbs)
+    R_total, R_each = env.total_rate(x, sbs_idx, h_sbs, h_mbs)
+
+    print("卸载决策 (0=本地,1=SBS,2=MBS):", choices)
     print("基站选择:", sbs_idx)
-    print("卸载决策:", choices)  # 0=本地, 1=SBS, 2=MBS
+    print("E (J):", E)
+    print("R_local (bit/s):", R_local)
+    print("R_sbs   (bit/s):", R_sbs)
+    print("R_mbs   (bit/s):", R_mbs)
+    print("R_each  (bit/s):", R_each)
+    print("R_total (bit/s):", R_total)
+
+    # ===== C4 验证 =====
+    print("\n===== C4 验证（每个 SBS / MBS 的 f 之和应=1）=====")
+    for j in range(env.n_sbs):
+        mask = (sbs_idx == j) & (x_sbs > 0)
+        if mask.sum() == 0:
+            print(f"SBS{j}: 无卸载用户"); continue
+        R_sub = R_sbs[mask]                      # 注意：这里 R_sbs 已是 min 后结果
+        # 用原始 R_trans 更准，但这里近似验证
+        A_vec = P_sbs[mask] * h_sbs[mask, j] / env.N0
+        from bandwidth_alloc import allocate_bandwidth
+        b_vec = allocate_bandwidth(np.maximum(A_vec,1e-12), env.b_sbs_total)
+        R_trans_sub = b_vec * np.log2(1 + A_vec / b_vec)
+        f_sub = env.allocate_compute(R_trans_sub, env.F_sbs_max, env.phi_sbs)
+        print(f"SBS{j}: 卸载用户数={mask.sum()}, sum(f)={f_sub.sum():.6f}")
+
+    if x_mbs.sum() > 0:
+        A_vec = P_mbs[x_mbs>0] * h_mbs[x_mbs>0] / env.N0
+        from bandwidth_alloc import allocate_bandwidth
+        b_vec = allocate_bandwidth(np.maximum(A_vec,1e-12), env.b_mbs_total)
+        R_trans_sub = b_vec * np.log2(1 + A_vec / b_vec)
+        f_mbs = env.allocate_compute(R_trans_sub, env.F_mbs_max, env.phi_mbs)
+        print(f"MBS: 卸载用户数={x_mbs.sum()}, sum(f)={f_mbs.sum():.6f}")
+    else:
+        print("MBS: 无卸载用户")

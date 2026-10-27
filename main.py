@@ -22,14 +22,21 @@ def train_one_run(seed, n_frames=10000, n_sbs=3, m_wd=5,
 
     log = []
     for t in range(n_frames):
+        
         h_sbs = env.channel_gain(env.d_sbs)
         h_mbs = env.channel_gain(env.d_mbs)
 
         sbs_idx, offload_actions = drl.select_actions(h_sbs, h_mbs)
         x = actions_to_onehot(offload_actions, m_wd)
 
-        R_total, _ = env.total_rate(x, sbs_idx, h_sbs, h_mbs)
-        drl.update_all(R_total)
+        R_total, R_each = env.total_rate(x, sbs_idx, h_sbs, h_mbs)
+
+        rewards_to_drl = R_each.copy()
+
+
+        drl.update_all_individual(rewards_to_drl)
+        
+        # 日志记录真实的系统总速率
         log.append(R_total)
 
         if (t + 1) % print_every == 0:
